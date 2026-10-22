@@ -1,0 +1,50 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: https://github.com/actions/checkout@v5
+      - uses: https://github.com/actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - run: test -z "$(gofmt -l .)"
+      - run: go vet ./...
+      - run: go test -race ./...
+
+  image:
+    needs: test
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: https://github.com/actions/checkout@v5
+      - name: Log in
+        env:
+          TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+        run: printf '%s' "$TOKEN" | docker login sarak.sh --username agent --password-stdin
+      # main is tagged main-<sha>-<unix time>, which Flux follows; a vX.Y.Z tag as X.Y.Z.
+      - name: Build and push
+        env:
+          IMAGE: sarak.sh/arr/unstuckarr
+        run: |
+          case "$GITHUB_REF" in
+            refs/tags/v*) tag=${GITHUB_REF#refs/tags/v} ;;
+            refs/heads/main) tag=main-${GITHUB_SHA::7}-$(date +%s) ;;
+            *) echo "nothing to push for $GITHUB_REF"; exit 0 ;;
+          esac
+          docker buildx build --push \
+            --platform linux/amd64,linux/arm64 \
+            --label "org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --tag "$IMAGE:$tag" \
+            .
