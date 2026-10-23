@@ -55,7 +55,11 @@ are spent; the count is kept in memory and starts afresh on restart and at midni
 The matched files are then sent to `POST /api/v3/manualimport`, which has the application
 evaluate them with their movie or episodes; a file it rejects for a reason outside the
 list above is not imported. The quality and languages are the application's for the file,
-else those of the grab. With `UNSTUCKARR_APPLY` true the rest are imported with a
+else those of the grab. When the application can parse neither the file's name nor the
+download's title, reprocessing fails (500, "Unable to parse movie info from path") and
+the checks it runs, such as whether the file is an upgrade, never run; such a file is
+imported only when its movie or none of its episodes has a file yet, with the quality the
+grab was parsed as, and is marked `unreprocessed` in the status. With `UNSTUCKARR_APPLY` true the rest are imported with a
 `ManualImport` command in `auto` mode, and the command is followed until it finishes, for
 at most six hours; until then the download is not looked at again. The command imports
 what it is given without checking it again.

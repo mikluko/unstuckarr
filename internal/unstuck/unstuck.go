@@ -7,8 +7,10 @@ package unstuck
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"slices"
 	"strings"
 	"sync"
@@ -35,6 +37,7 @@ type API interface {
 	Reprocess(ctx context.Context, files []arr.Reprocess) ([]arr.ImportItem, error)
 	StartManualImport(ctx context.Context, files []arr.ImportFile) (arr.Command, error)
 	Command(ctx context.Context, id int) (arr.Command, error)
+	Movie(ctx context.Context, id int) (arr.Movie, error)
 }
 
 // Asker answers choice questions; *typesafe.Client is one.
@@ -71,6 +74,9 @@ type File struct {
 	Source string `json:"source,omitempty"`
 	// Skipped is why it is not imported, or "".
 	Skipped string `json:"skipped,omitempty"`
+	// Unreprocessed is a file the application could not reprocess, imported
+	// on the listing's rejections alone.
+	Unreprocessed bool `json:"unreprocessed,omitempty"`
 }
 
 // Outcome is what became of an import.
@@ -370,7 +376,7 @@ func (e *Engine) item(ctx context.Context, kind arr.Kind, api API, g []arr.Queue
 	if it.Decision != "" {
 		return it
 	}
-	files, err := reprocess(ctx, api, kind, plan, first)
+	files, err := reprocess(ctx, api, kind, plan, g)
 	if err != nil {
 		it.Decision, it.Reasons = Failed, append(it.Reasons, err.Error())
 		span.SetStatus(codes.Error, err.Error())
@@ -730,14 +736,32 @@ func languages(file, grab json.RawMessage) json.RawMessage {
 
 // reprocess has the application evaluate the planned files with their
 // targets and returns those it raises no blocking rejection against, as
-// files of a ManualImport command.
-func reprocess(ctx context.Context, api API, kind arr.Kind, plan []planned, first arr.QueueRecord) ([]arr.ImportFile, error) {
+// files of a ManualImport command. A file the application cannot reprocess
+// because it can parse neither its name nor the download's is judged by
+// unreprocessed instead.
+func reprocess(ctx context.Context, api API, kind arr.Kind, plan []planned, g []arr.QueueRecord) ([]arr.ImportFile, error) {
 	reqs := make([]arr.Reprocess, len(plan))
 	for i, p := range plan {
 		reqs[i] = p.req
 	}
 	res, err := api.Reprocess(ctx, reqs)
-	if err != nil {
+	unparsed := make([]bool, len(plan))
+	if err != nil && cannotParse(err) {
+		res = make([]arr.ImportItem, len(plan))
+		for i, req := range reqs {
+			one, err := api.Reprocess(ctx, []arr.Reprocess{req})
+			switch {
+			case err != nil && cannotParse(err):
+				unparsed[i] = true
+			case err != nil:
+				return nil, fmt.Errorf("reprocess: %w", err)
+			case len(one) != 1:
+				return nil, fmt.Errorf("reprocess: %d files back for 1 sent", len(one))
+			default:
+				res[i] = one[0]
+			}
+		}
+	} else if err != nil {
 		return nil, fmt.Errorf("reprocess: %w", err)
 	}
 	if len(res) != len(reqs) {
@@ -746,6 +770,19 @@ func reprocess(ctx context.Context, api API, kind arr.Kind, plan []planned, firs
 	var files []arr.ImportFile
 	for i, r := range res {
 		p := plan[i]
+		if unparsed[i] {
+			f, skip, err := unreprocessed(ctx, api, kind, p, g)
+			if err != nil {
+				return nil, err
+			}
+			if skip != "" {
+				p.file.Skipped = skip
+				continue
+			}
+			p.file.Unreprocessed = true
+			files = append(files, f)
+			continue
+		}
 		blocking, _ := reasonsOf(r.Rejections)
 		if kind == arr.Radarr && (r.Movie == nil || r.Movie.ID != p.req.MovieID) {
 			blocking = append(blocking, "reprocessing matched it to another movie")
@@ -775,7 +812,7 @@ func reprocess(ctx context.Context, api API, kind arr.Kind, plan []planned, firs
 			ReleaseGroup: cmp(r.ReleaseGroup, p.req.ReleaseGroup),
 			IndexerFlags: r.IndexerFlags,
 			ReleaseType:  cmp(r.ReleaseType, p.req.ReleaseType),
-			DownloadID:   first.DownloadID,
+			DownloadID:   p.req.DownloadID,
 		}
 		if kind == arr.Radarr {
 			f.ReleaseType = ""
@@ -783,6 +820,54 @@ func reprocess(ctx context.Context, api API, kind arr.Kind, plan []planned, firs
 		files = append(files, f)
 	}
 	return files, nil
+}
+
+// cannotParse reports whether err is the application failing to reprocess
+// a file because it can parse neither the file's path nor the download's
+// title: Radarr and Sonarr answer 500 with "Unable to parse movie (or
+// episode) info from path".
+func cannotParse(err error) bool {
+	var e *arr.Error
+	return errors.As(err, &e) && e.Status == http.StatusInternalServerError && strings.Contains(e.Body, "info from path")
+}
+
+// unreprocessed returns the ManualImport file for a planned file the
+// application could not reprocess, or why it is not imported. The listing's
+// rejections were all overrulable, but the checks reprocessing runs, such as
+// whether it is an upgrade, never ran; so it is imported only into a movie
+// or episodes without a file, and with the quality the grab was parsed as.
+func unreprocessed(ctx context.Context, api API, kind arr.Kind, p planned, g []arr.QueueRecord) (arr.ImportFile, string, error) {
+	if !arr.KnownQuality(p.req.Quality) {
+		return arr.ImportFile{}, "the application cannot reprocess it and its quality is unknown", nil
+	}
+	if kind == arr.Radarr {
+		m, err := api.Movie(ctx, p.req.MovieID)
+		if err != nil {
+			return arr.ImportFile{}, "", fmt.Errorf("movie %d: %w", p.req.MovieID, err)
+		}
+		if m.HasFile {
+			return arr.ImportFile{}, "the application cannot reprocess it and the movie has a file: whether it is an upgrade is unchecked", nil
+		}
+	} else {
+		for _, r := range g {
+			if r.EpisodeHasFile && slices.Contains(p.req.EpisodeIDs, r.EpisodeID) {
+				return arr.ImportFile{}, "the application cannot reprocess it and an episode has a file: whether it is an upgrade is unchecked", nil
+			}
+		}
+	}
+	return arr.ImportFile{
+		Path:         p.req.Path,
+		FolderName:   p.from.FolderName,
+		MovieID:      p.req.MovieID,
+		SeriesID:     p.req.SeriesID,
+		EpisodeIDs:   p.req.EpisodeIDs,
+		Quality:      p.req.Quality,
+		Languages:    p.req.Languages,
+		ReleaseGroup: p.req.ReleaseGroup,
+		IndexerFlags: p.req.IndexerFlags,
+		ReleaseType:  p.req.ReleaseType,
+		DownloadID:   p.req.DownloadID,
+	}, "", nil
 }
 
 func cmp(v, fallback string) string {

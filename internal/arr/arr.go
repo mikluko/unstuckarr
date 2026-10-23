@@ -72,6 +72,7 @@ type QueueRecord struct {
 	TrackedDownloadState  string          `json:"trackedDownloadState"`
 	StatusMessages        []StatusMessage `json:"statusMessages"`
 	DownloadID            string          `json:"downloadId"`
+	EpisodeHasFile        bool            `json:"episodeHasFile"`
 	OutputPath            string          `json:"outputPath"`
 	Quality               json.RawMessage `json:"quality"`
 	Languages             json.RawMessage `json:"languages"`
@@ -221,6 +222,19 @@ func (c *Client) StartManualImport(ctx context.Context, files []ImportFile) (Com
 		"importMode": "auto",
 	}, &cmd)
 	return cmd, err
+}
+
+// Movie is a Radarr movie.
+type Movie struct {
+	ID      int  `json:"id"`
+	HasFile bool `json:"hasFile"`
+}
+
+// Movie returns the Radarr movie.
+func (c *Client) Movie(ctx context.Context, id int) (Movie, error) {
+	var m Movie
+	err := c.do(ctx, http.MethodGet, "/api/v3/movie/"+strconv.Itoa(id), nil, nil, &m)
+	return m, err
 }
 
 // Command returns the command's current state.

@@ -3,6 +3,7 @@ package unstuck
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -27,6 +28,11 @@ type fakeArr struct {
 	rejections map[string][]arr.Rejection
 	// broken are downloads whose listing fails.
 	broken map[string]bool
+	// unparseable are paths reprocessing fails on as Radarr 6.4 does for a
+	// name it cannot parse.
+	unparseable map[string]bool
+	// withFile are the movies that have a file.
+	withFile map[int]bool
 
 	mu          sync.Mutex
 	listed      map[string]int
@@ -82,6 +88,17 @@ func (f *fakeArr) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		f.reprocessed = append(f.reprocessed, reqs)
+		for _, q := range reqs {
+			if f.unparseable[q.Path] {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusInternalServerError)
+				_ = json.NewEncoder(w).Encode(map[string]string{
+					"message":     "Unable to parse movie info from path: " + q.Path,
+					"description": "NzbDrone.Core.MediaFiles.MovieImport.Aggregation.AugmentingFailedException: Unable to parse movie info from path: " + q.Path + "\n   at NzbDrone.Core.MediaFiles.MovieImport.Aggregation.AggregationService.Augment(LocalMovie localMovie, DownloadClientItem downloadClientItem)",
+				})
+				return
+			}
+		}
 		var items []arr.ImportItem
 		for _, q := range reqs {
 			it := arr.ImportItem{ID: q.ID, Path: q.Path, SeasonNumber: q.SeasonNumber, Quality: q.Quality, Languages: q.Languages,
@@ -110,8 +127,12 @@ func (f *fakeArr) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			out = arr.Command{ID: 42, Name: "ManualImport", Status: "completed", Result: "successful", Message: "Completed"}
 		}
 	default:
-		http.NotFound(w, r)
-		return
+		var id int
+		if _, err := fmt.Sscanf(r.URL.Path, "/api/v3/movie/%d", &id); err != nil || r.Method != http.MethodGet {
+			http.NotFound(w, r)
+			return
+		}
+		out = arr.Movie{ID: id, HasFile: f.withFile[id]}
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(out)
@@ -499,5 +520,67 @@ func TestErrorIsolation(t *testing.T) {
 	run := e.Run(context.Background(), arr.Radarr, f.client(t))
 	if run.Items[0].Decision != Failed || !strings.Contains(run.Items[0].Reasons[0], "500") || run.Items[1].Decision != Import {
 		t.Fatalf("items %+v %+v", run.Items[0], run.Items[1])
+	}
+}
+
+func TestRadarrCannotReprocess(t *testing.T) {
+	for _, c := range []struct {
+		name     string
+		withFile bool
+		decision string
+	}{
+		{"movie without a file", false, Import},
+		{"movie with a file", true, LeftAlone},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			f := &fakeArr{kind: arr.Radarr,
+				queue:       []arr.QueueRecord{movieRecord("KIKI", 3, "Kiki_Delivery_Service.mkv")},
+				listing:     map[string][]arr.ImportItem{"KIKI": {unparsable("/mnt/radarr/Kiki_Delivery_Service.mkv", 35e9, 3)}},
+				unparseable: map[string]bool{"/mnt/radarr/Kiki_Delivery_Service.mkv": true},
+				withFile:    map[int]bool{3: c.withFile},
+			}
+			e := engine(true)
+			run := e.Run(context.Background(), arr.Radarr, f.client(t))
+			e.Wait()
+			it := run.Items[0]
+			if it.Decision != c.decision {
+				t.Fatalf("item %+v", it)
+			}
+			if !c.withFile {
+				want := arr.ImportFile{Path: "/mnt/radarr/Kiki_Delivery_Service.mkv", MovieID: 3, Quality: bluray, Languages: japanese, DownloadID: "KIKI"}
+				if len(f.commands) != 1 || !sameFile(f.commands[0].Files[0], want) || !it.Files[0].Unreprocessed {
+					t.Fatalf("commands %+v, file %+v", f.commands, it.Files[0])
+				}
+				return
+			}
+			if len(f.commands) != 0 || !strings.Contains(it.Files[0].Skipped, "the movie has a file") {
+				t.Fatalf("commands %+v, file %+v", f.commands, it.Files[0])
+			}
+		})
+	}
+}
+
+func TestReprocessOneByOne(t *testing.T) {
+	f := &fakeArr{kind: arr.Sonarr,
+		queue: seriesRecords("RU", "Фонари (сезон 1)", grabbed),
+		listing: map[string][]arr.ImportItem{"RU": {
+			episodeItem("Фонари/01. Пилот.mkv", "Unable to parse file"),
+			episodeItem("Фонари/02. Доверие.mkv", "Unable to parse file"),
+		}},
+		unparseable: map[string]bool{"/mnt/sonarr/dl/Фонари/01. Пилот.mkv": true},
+	}
+	f.queue[1].EpisodeHasFile = true
+	e := engine(false)
+	it := e.Run(context.Background(), arr.Sonarr, f.client(t)).Items[0]
+	if it.Decision != Import || !it.Files[0].Unreprocessed || it.Files[1].Unreprocessed || it.Files[1].Skipped != "" {
+		t.Fatalf("item %+v", it)
+	}
+	if len(f.reprocessed) != 3 {
+		t.Fatalf("%d reprocess requests: the batch, then each file", len(f.reprocessed))
+	}
+	f.queue[0].EpisodeHasFile = true
+	it = e.Run(context.Background(), arr.Sonarr, f.client(t)).Items[0]
+	if !strings.Contains(it.Files[0].Skipped, "an episode has a file") {
+		t.Fatalf("file %+v", it.Files[0])
 	}
 }
